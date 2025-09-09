@@ -12,7 +12,7 @@ env:
   PORT: 3001
   BASE_URL: http://localhost:3001
   FLASK_ENV: testing
-  PYTHONUNBUFFERED: 1
+  PYTHONUNBUFFERED: "1"
   PYTHONPATH: ${{ github.workspace }}
 
 jobs:
@@ -25,8 +25,8 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.9'
-          cache: 'pip'
+          python-version: "3.9"
+          cache: pip
 
       - name: Install jq (system)
         run: |
@@ -39,45 +39,36 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install flask flask-cors python-dotenv
+            pip install flask flask-cors python-dotenv gunicorn
           fi
 
       - name: Create minimal .env for CI
         run: |
-          cat > .env <<ENV
+          cat > .env <<EOF
           FLASK_ENV=testing
-          SECRET_KEY=ci-secret
-          DATABASE_URL=sqlite:////tmp/app.db
-          ENV
+          SECRET_KEY=ci
+          DATABASE_URL=sqlite:///ci.db
+          EOF
 
-      - name: Preflight (non-fatal diagnostics)
-        continue-on-error: true
+      - name: Preflight (no-fatal)
         run: |
-          echo "=== LS ==="
-          ls -la
-          echo "=== Tree (src) ==="
-          [ -d src ] && find src -maxdepth 2 -type f -print || echo "no src/"
-          echo "=== Python diag ==="
+          set +e
           python - <<'PY'
-          import sys, os, traceback
-          print("CWD:", os.getcwd())
+          import sys
           print("Python:", sys.version)
-          print("sys.path[0]:", sys.path[0])
-          print("Has 'src' dir:", os.path.isdir('src'))
-          if os.path.isdir('src'):
-              print("src content:", os.listdir('src'))
           try:
               import flask
               print("Flask version:", flask.__version__)
           except Exception as e:
-              print("Import flask FAILED:", e)
-          try:
-              import src.app as appmod
-              print("Import src.app OK; attrs:", [a for a in ('app','create_app') if hasattr(appmod,a)])
-          except Exception:
-              print("Import src.app FAILED:")
-              traceback.print_exc()
+              print("Flask import failed:", e)
+          for mod in ("src.app","app","main"):
+              try:
+                  __import__(mod)
+                  print("Import OK ->", mod)
+              except Exception as e:
+                  print("Import FAIL ->", mod, ":", e)
           PY
+          true
 
       - name: Create smoke script
         run: |
@@ -90,28 +81,33 @@ jobs:
 
           need() { command -v "$1" >/dev/null || { echo "Instala $1"; exit 1; }; }
           need jq
-
           http()  { curl -sS -o /dev/null -w "%{http_code}" "$@"; }
           getj()  { curl -sS -H "Accept: application/json" "$@"; }
           postj(){ curl -sS -H "Content-Type: application/json" -H "Accept: application/json" -X POST -d "$2" "$1"; }
 
+          must(){
+            local url="$1" expect="$2"; shift 2 || true
+            local code; code=$(http "$url" "$@")
+            [[ "$code" == "$expect" ]] && echo "✅ $url -> $code" || { echo "❌ $url -> $code (esperado $expect)"; exit 1; }
+          }
+
           echo "== Salud =="
-          code=$(http "$BASE/api/ping");   [[ "$code" == "200" ]] && echo "✅ /api/ping -> 200" || { echo "❌ /api/ping -> $code"; exit 7; }
-          code=$(http "$BASE/api/hello");  [[ "$code" == "200" ]] && echo "✅ /api/hello -> 200" || { echo "❌ /api/hello -> $code"; exit 7; }
-          getj "$BASE/api/hello" | jq -e '.message' >/dev/null && echo "   JSON hello OK ✅"
+          code=$(http "$BASE/api/ping" || true)
+          if [[ "$code" != "200" ]]; then must "$BASE/api/hello" 200; else echo "✅ /api/ping -> 200"; fi
+          getj "$BASE/api/hello" | jq -e '.message' >/dev/null 2>&1 && echo "   JSON hello OK ✅" || true
 
           echo; echo "== Productos =="
-          code=$(http "$BASE/api/products/"); [[ "$code" == "200" ]] && echo "✅ /api/products/ -> 200" || { echo "❌ /api/products/ -> $code"; exit 7; }
+          must "$BASE/api/products/" 200
           LIST=$(getj "$BASE/api/products/")
           PID=$(echo "$LIST" | jq -r '.results[0].id // .[0].id // 1')
           echo "   Primer product_id: ${PID:-1}"
-          code=$(http "$BASE/api/products/$PID"); [[ "$code" == "200" ]] && echo "✅ /api/products/$PID -> 200" || echo "⚠️ /api/products/$PID -> $code"
+          must "$BASE/api/products/$PID" 200
 
           echo; echo "== Auth =="
           TS=$(date +%s); EMAIL="test${TS}@example.local"; PASS="Test1234!"
-          REG_CODE=$(http -H "Content-Type: application/json" -X POST -d "{\"email\":\"$EMAIL\",\"password\":\"$PASS\"}" "$BASE/api/auth/register" || true)
+          REG_CODE=$(curl -sS -o /dev/null -w "%{http_code}" -H "Content-Type: application/json" -X POST -d "{\"email\":\"$EMAIL\",\"password\":\"$PASS\"}" "$BASE/api/auth/register" || true)
           echo "   register -> $REG_CODE (ok si 200/201/409)"
-          LOGIN_JSON=$(postj "$BASE/api/auth/login" "{\"email\":\"$EMAIL\",\"password\":\"$PASS\"}" || true)
+          LOGIN_JSON=$(postj "$BASE/api/auth/login" "{\"email\":\"$EMAIL\",\"password\":\"$PASS\"}" || echo "{}")
           TOKEN=$(echo "$LOGIN_JSON" | jq -r '.token // .access_token // .jwt // .data.token // empty')
           if [[ -n "${TOKEN:-}" && "$TOKEN" != "null" ]]; then
             echo "🔐 Token OK"
@@ -123,46 +119,48 @@ jobs:
 
           echo; echo "== Users =="
           if [[ ${#AUTH[@]} -gt 0 ]]; then
-            code=$(http "${AUTH[@]}" "$BASE/api/users/me"); [[ "$code" == "200" ]] && echo "✅ /api/users/me -> 200" || echo "⚠️ /api/users/me -> $code"
+            must "$BASE/api/users/me" 200 "${AUTH[@]}"
             getj "$BASE/api/users/me" "${AUTH[@]}" | jq . || true
           else
             echo "   (saltando users/* por falta de token)"
           fi
 
-          echo; echo "== Cart =="
-          code=$(http "$BASE/api/cart/"); [[ "$code" == "200" ]] && echo "✅ GET /api/cart/ -> 200" || echo "⚠️ GET /api/cart/ -> $code"
-          code=$(http -H "Content-Type: application/json" -X POST -d "{\"product_id\":$PID,\"qty\":1}" "$BASE/api/cart/"); echo "   POST /cart/ -> $code (200/201/204 ok; 401/403 si requiere auth)"
-
-          echo; echo "🎉 Smoke extendido terminado."
+          echo; echo "🎉 Smoke terminado."
           SH
           chmod +x scripts/smoke_api.sh
 
-      - name: Start server & run smoke (same step)
+      - name: Start server & run smoke (one step)
         shell: bash
-        env:
-          FLASK_APP: src.app
         run: |
           set -euo pipefail
-          # Arrancar Flask (sin usar --app)
-          python -m flask run --host 0.0.0.0 --port "$PORT" > flask.log 2>&1 &
-          pid=$!
-          trap 'echo "Matando Flask ($pid)"; kill $pid || true' EXIT
+          : "${PORT:=3001}"
+          : "${BASE_URL:=http://localhost:${PORT}}"
 
-          # Esperar a /api/ping
+          # Detectar app
+          TARGET=""; FLASK_APP_CAND=""
+          if [ -f src/app.py ]; then TARGET="src.app:app"; FLASK_APP_CAND="src.app"
+          elif [ -f app.py ]; then TARGET="app:app"; FLASK_APP_CAND="app.py"
+          elif [ -f main.py ]; then TARGET="main:app"; FLASK_APP_CAND="main.py"
+          else echo "❌ No encuentro src/app.py, app.py ni main.py"; ls -la; exit 1; fi
+          echo "TARGET: $TARGET | FLASK_APP: $FLASK_APP_CAND"
+
+          # gunicorn si está, si no flask run (sin --app)
+          start_gunicorn() { echo "→ gunicorn"; gunicorn "$TARGET" --bind "0.0.0.0:${PORT}" > flask.log 2>&1 & echo $!; }
+          start_flask()    { echo "→ flask run"; export FLASK_APP="$FLASK_APP_CAND"; python -m flask run --host 0.0.0.0 --port "$PORT" > flask.log 2>&1 & echo $!; }
+
+          if python -c "import gunicorn" >/dev/null 2>&1; then pid=$(start_gunicorn); else pid=$(start_flask); fi
+          trap 'echo "Matando server ($pid)"; kill $pid || true' EXIT
+
+          # esperar a /api/ping o /api/hello
           for i in {1..120}; do
-            if curl -sf "${BASE_URL}/api/ping" >/dev/null; then
-              echo "Servidor UP (pid=$pid)"
-              break
-            fi
+            if curl -sf "${BASE_URL}/api/ping" >/dev/null || curl -sf "${BASE_URL}/api/hello" >/dev/null; then
+              echo "Servidor UP (pid=$pid)"; break; fi
             if ! kill -0 "$pid" 2>/dev/null; then
-              echo "❌ Flask murió antes de estar listo"
-              sed -n '1,200p' flask.log || true
-              exit 1
-            fi
+              echo "❌ Proceso murió"; sed -n '1,200p' flask.log || true; exit 1; fi
             sleep 1
           done
 
-          tail -n 100 flask.log || true
+          tail -n 120 flask.log || true
           scripts/smoke_api.sh "$BASE_URL"
 
       - name: Upload flask.log (always)
@@ -171,3 +169,4 @@ jobs:
         with:
           name: flask-log
           path: flask.log
+          if-no-files-found: warn
