@@ -149,19 +149,25 @@ jobs:
           SH
           chmod +x scripts/smoke_api.sh
 
-      - name: Start Flask server (fixed)
+      - name: Start Flask server (Flask 1.x style)
+        env:
+          FLASK_APP: src.app
         run: |
           set -euo pipefail
-          echo "Arrancando con --app src.app"
-          nohup python -m flask --app src.app run --host 0.0.0.0 --port "$PORT" > flask.log 2>&1 &
+          echo "Arrancando Flask (${FLASK_APP})…"
+          nohup python -m flask run --host 0.0.0.0 --port "$PORT" > flask.log 2>&1 &
+          pid=$!
           for i in {1..120}; do
             if curl -sf "http://localhost:${PORT}/api/ping" >/dev/null; then
-              echo "Servidor UP"; break
+              echo "Servidor UP (pid=$pid)"; break
+            fi
+            if ! kill -0 "$pid" 2>/dev/null; then
+              echo "❌ Proceso Flask salió prematuramente"; break
             fi
             sleep 1
           done
           echo "---- tail flask.log ----"
-          tail -n 80 flask.log || true
+          tail -n 120 flask.log || true
 
       - name: Run smoke tests
         run: scripts/smoke_api.sh "$BASE_URL"
