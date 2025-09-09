@@ -18,7 +18,6 @@ env:
 jobs:
   smoke:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,20 +50,33 @@ jobs:
           DATABASE_URL=sqlite:////tmp/app.db
           ENV
 
-      - name: Preflight (Flask version & import app)
+      - name: Preflight (non-fatal diagnostics)
+        continue-on-error: true
         run: |
+          echo "=== LS ==="
+          ls -la
+          echo "=== Tree (src) ==="
+          [ -d src ] && find src -maxdepth 2 -type f -print || echo "no src/"
+          echo "=== Python diag ==="
           python - <<'PY'
-          import sys
+          import sys, os, traceback
+          print("CWD:", os.getcwd())
+          print("Python:", sys.version)
+          print("sys.path[0]:", sys.path[0])
+          print("Has 'src' dir:", os.path.isdir('src'))
+          if os.path.isdir('src'):
+              print("src content:", os.listdir('src'))
           try:
               import flask
               print("Flask version:", flask.__version__)
           except Exception as e:
-              print("Cannot import Flask:", e); sys.exit(1)
+              print("Import flask FAILED:", e)
           try:
               import src.app as appmod
-              print("Import src.app OK")
-          except Exception as e:
-              print("Import src.app FAILED:", e); sys.exit(1)
+              print("Import src.app OK; attrs:", [a for a in ('app','create_app') if hasattr(appmod,a)])
+          except Exception:
+              print("Import src.app FAILED:")
+              traceback.print_exc()
           PY
 
       - name: Create smoke script
@@ -131,18 +143,12 @@ jobs:
           FLASK_APP: src.app
         run: |
           set -euo pipefail
-          set -x
-
-          # Info
-          python -m flask --version || true
-          python -m flask routes || true
-
-          # Arrancar Flask y log a archivo
+          # Arrancar Flask (sin usar --app)
           python -m flask run --host 0.0.0.0 --port "$PORT" > flask.log 2>&1 &
           pid=$!
           trap 'echo "Matando Flask ($pid)"; kill $pid || true' EXIT
 
-          # Espera activa a /api/ping
+          # Esperar a /api/ping
           for i in {1..120}; do
             if curl -sf "${BASE_URL}/api/ping" >/dev/null; then
               echo "Servidor UP (pid=$pid)"
@@ -157,8 +163,6 @@ jobs:
           done
 
           tail -n 100 flask.log || true
-
-          # Smoke
           scripts/smoke_api.sh "$BASE_URL"
 
       - name: Upload flask.log (always)
