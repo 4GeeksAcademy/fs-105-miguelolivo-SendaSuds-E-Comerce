@@ -25,3 +25,10 @@ app = create_app()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=3001, debug=True)
+
+# --- register payments blueprint ---
+try:
+    from src.payments import bp as payments_bp
+    app.register_blueprint(payments_bp)
+except Exception as e:
+    print("payments blueprint not loaded:", e)

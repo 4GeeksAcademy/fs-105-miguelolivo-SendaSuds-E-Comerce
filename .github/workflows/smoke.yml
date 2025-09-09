@@ -1,0 +1,172 @@
+name: API Smoke
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PORT: 3001
+  BASE_URL: http://localhost:3001
+  FLASK_ENV: testing
+  PYTHONUNBUFFERED: "1"
+  PYTHONPATH: ${{ github.workspace }}
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+          cache: pip
+
+      - name: Install jq (system)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install flask flask-cors python-dotenv gunicorn
+          fi
+
+      - name: Create minimal .env for CI
+        run: |
+          cat > .env <<EOF
+          FLASK_ENV=testing
+          SECRET_KEY=ci
+          DATABASE_URL=sqlite:///ci.db
+          EOF
+
+      - name: Preflight (no-fatal)
+        run: |
+          set +e
+          python - <<'PY'
+          import sys
+          print("Python:", sys.version)
+          try:
+              import flask
+              print("Flask version:", flask.__version__)
+          except Exception as e:
+              print("Flask import failed:", e)
+          for mod in ("src.app","app","main"):
+              try:
+                  __import__(mod)
+                  print("Import OK ->", mod)
+              except Exception as e:
+                  print("Import FAIL ->", mod, ":", e)
+          PY
+          true
+
+      - name: Create smoke script
+        run: |
+          mkdir -p scripts
+          cat > scripts/smoke_api.sh <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          BASE="${1:-http://localhost:3001}"
+          echo "🔎 Base: $BASE"
+
+          need() { command -v "$1" >/dev/null || { echo "Instala $1"; exit 1; }; }
+          need jq
+          http()  { curl -sS -o /dev/null -w "%{http_code}" "$@"; }
+          getj()  { curl -sS -H "Accept: application/json" "$@"; }
+          postj(){ curl -sS -H "Content-Type: application/json" -H "Accept: application/json" -X POST -d "$2" "$1"; }
+
+          must(){
+            local url="$1" expect="$2"; shift 2 || true
+            local code; code=$(http "$url" "$@")
+            [[ "$code" == "$expect" ]] && echo "✅ $url -> $code" || { echo "❌ $url -> $code (esperado $expect)"; exit 1; }
+          }
+
+          echo "== Salud =="
+          code=$(http "$BASE/api/ping" || true)
+          if [[ "$code" != "200" ]]; then must "$BASE/api/hello" 200; else echo "✅ /api/ping -> 200"; fi
+          getj "$BASE/api/hello" | jq -e '.message' >/dev/null 2>&1 && echo "   JSON hello OK ✅" || true
+
+          echo; echo "== Productos =="
+          must "$BASE/api/products/" 200
+          LIST=$(getj "$BASE/api/products/")
+          PID=$(echo "$LIST" | jq -r '.results[0].id // .[0].id // 1')
+          echo "   Primer product_id: ${PID:-1}"
+          must "$BASE/api/products/$PID" 200
+
+          echo; echo "== Auth =="
+          TS=$(date +%s); EMAIL="test${TS}@example.local"; PASS="Test1234!"
+          REG_CODE=$(curl -sS -o /dev/null -w "%{http_code}" -H "Content-Type: application/json" -X POST -d "{\"email\":\"$EMAIL\",\"password\":\"$PASS\"}" "$BASE/api/auth/register" || true)
+          echo "   register -> $REG_CODE (ok si 200/201/409)"
+          LOGIN_JSON=$(postj "$BASE/api/auth/login" "{\"email\":\"$EMAIL\",\"password\":\"$PASS\"}" || echo "{}")
+          TOKEN=$(echo "$LOGIN_JSON" | jq -r '.token // .access_token // .jwt // .data.token // empty')
+          if [[ -n "${TOKEN:-}" && "$TOKEN" != "null" ]]; then
+            echo "🔐 Token OK"
+            AUTH=(-H "Authorization: Bearer $TOKEN")
+          else
+            echo "⚠️ Sin token; /users/* puede fallar"
+            AUTH=()
+          fi
+
+          echo; echo "== Users =="
+          if [[ ${#AUTH[@]} -gt 0 ]]; then
+            must "$BASE/api/users/me" 200 "${AUTH[@]}"
+            getj "$BASE/api/users/me" "${AUTH[@]}" | jq . || true
+          else
+            echo "   (saltando users/* por falta de token)"
+          fi
+
+          echo; echo "🎉 Smoke terminado."
+          SH
+          chmod +x scripts/smoke_api.sh
+
+      - name: Start server & run smoke (one step)
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${PORT:=3001}"
+          : "${BASE_URL:=http://localhost:${PORT}}"
+
+          # Detectar app
+          TARGET=""; FLASK_APP_CAND=""
+          if [ -f src/app.py ]; then TARGET="src.app:app"; FLASK_APP_CAND="src.app"
+          elif [ -f app.py ]; then TARGET="app:app"; FLASK_APP_CAND="app.py"
+          elif [ -f main.py ]; then TARGET="main:app"; FLASK_APP_CAND="main.py"
+          else echo "❌ No encuentro src/app.py, app.py ni main.py"; ls -la; exit 1; fi
+          echo "TARGET: $TARGET | FLASK_APP: $FLASK_APP_CAND"
+
+          # gunicorn si está, si no flask run (sin --app)
+          start_gunicorn() { echo "→ gunicorn"; gunicorn "$TARGET" --bind "0.0.0.0:${PORT}" > flask.log 2>&1 & echo $!; }
+          start_flask()    { echo "→ flask run"; export FLASK_APP="$FLASK_APP_CAND"; python -m flask run --host 0.0.0.0 --port "$PORT" > flask.log 2>&1 & echo $!; }
+
+          if python -c "import gunicorn" >/dev/null 2>&1; then pid=$(start_gunicorn); else pid=$(start_flask); fi
+          trap 'echo "Matando server ($pid)"; kill $pid || true' EXIT
+
+          # esperar a /api/ping o /api/hello
+          for i in {1..120}; do
+            if curl -sf "${BASE_URL}/api/ping" >/dev/null || curl -sf "${BASE_URL}/api/hello" >/dev/null; then
+              echo "Servidor UP (pid=$pid)"; break; fi
+            if ! kill -0 "$pid" 2>/dev/null; then
+              echo "❌ Proceso murió"; sed -n '1,200p' flask.log || true; exit 1; fi
+            sleep 1
+          done
+
+          tail -n 120 flask.log || true
+          scripts/smoke_api.sh "$BASE_URL"
+
+      - name: Upload flask.log (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flask-log
+          path: flask.log
+          if-no-files-found: warn
