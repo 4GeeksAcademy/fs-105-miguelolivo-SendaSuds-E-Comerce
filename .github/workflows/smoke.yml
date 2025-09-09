@@ -42,6 +42,19 @@ jobs:
             pip install flask flask-cors python-dotenv
           fi
 
+      - name: Create minimal .env for CI
+        run: |
+          cat > .env <<EOF
+          FLASK_ENV=testing
+          SECRET_KEY=test
+          JWT_SECRET_KEY=jwt-test
+          DATABASE_URL=sqlite:///ci.db
+          SQLALCHEMY_DATABASE_URI=sqlite:///ci.db
+          CLOUDINARY_URL=cloudinary://dummy:dummy@dummy
+          STRIPE_PUBLIC_KEY=dummy
+          STRIPE_SECRET_KEY=dummy
+          EOF
+
       - name: Create smoke script
         run: |
           mkdir -p scripts
@@ -136,30 +149,19 @@ jobs:
           SH
           chmod +x scripts/smoke_api.sh
 
-      - name: Start Flask server (auto-detect)
-        id: start
+      - name: Start Flask server (fixed)
         run: |
           set -euo pipefail
-          opts=("src.app" "src.app:create_app()" "src.wsgi:app")
-          for opt in "${opts[@]}"; do
-            echo "Probando --app $opt"
-            nohup python -m flask --app "$opt" run --host 0.0.0.0 --port "$PORT" > flask.log 2>&1 &
-            pid=$!
-            for i in {1..40}; do
-              if curl -sf "http://localhost:${PORT}/api/ping" >/dev/null; then
-                echo "UP con $opt (pid=$pid)"
-                echo "pid=$pid" >> $GITHUB_OUTPUT
-                echo "app=$opt" >> $GITHUB_OUTPUT
-                break 2
-              fi
-              sleep 1
-            done
-            echo "No levantó con $opt; matando $pid"
-            kill $pid || true
+          echo "Arrancando con --app src.app"
+          nohup python -m flask --app src.app run --host 0.0.0.0 --port "$PORT" > flask.log 2>&1 &
+          for i in {1..120}; do
+            if curl -sf "http://localhost:${PORT}/api/ping" >/dev/null; then
+              echo "Servidor UP"; break
+            fi
             sleep 1
           done
-          echo "Check /api/hello:"
-          curl -i "http://localhost:${PORT}/api/hello" || true
+          echo "---- tail flask.log ----"
+          tail -n 80 flask.log || true
 
       - name: Run smoke tests
         run: scripts/smoke_api.sh "$BASE_URL"
