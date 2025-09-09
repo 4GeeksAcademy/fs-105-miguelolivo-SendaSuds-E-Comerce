@@ -1,0 +1,78 @@
+name: API Smoke
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    env:
+      PORT: "3001"
+      BASE_URL: "http://localhost:3001"
+      PYTHONUNBUFFERED: "1"
+      FLASK_ENV: testing
+      PYTHONPATH: ${{ github.workspace }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install flask flask-cors python-dotenv jq
+          fi
+
+      - name: Start Flask server (auto-detect app module)
+        id: start
+        run: |
+          set -euo pipefail
+          echo "Arrancando Flask…"
+          opts=("src.app" "src.app:create_app()" "src.wsgi:app")
+          for opt in "${opts[@]}"; do
+            echo "Probando --app $opt"
+            nohup python -m flask --app "$opt" run --host 0.0.0.0 --port "$PORT" > flask.log 2>&1 &
+            pid=$!
+            for i in {1..40}; do
+              if curl -sf "http://localhost:${PORT}/api/ping" >/dev/null; then
+                echo "UP con $opt (pid=$pid)"
+                echo "pid=$pid" >> $GITHUB_OUTPUT
+                echo "app=$opt" >> $GITHUB_OUTPUT
+                break 2
+              fi
+              sleep 1
+            done
+            echo "No levantó con $opt; matando $pid"
+            kill $pid || true
+            sleep 1
+          done
+          echo "Servidor debería estar arriba. Comprobando /api/hello:"
+          curl -i "http://localhost:${PORT}/api/hello" || true
+
+      - name: Run smoke tests
+        run: scripts/smoke_api.sh "$BASE_URL"
+
+      - name: Upload flask.log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flask-log
+          path: flask.log
+
+      - name: Stop server
+        if: always()
+        run: pkill -f "flask run" || true
