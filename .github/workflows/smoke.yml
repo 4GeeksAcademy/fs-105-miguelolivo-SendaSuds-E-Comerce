@@ -71,7 +71,6 @@ jobs:
           getj()  { curl -sS -H "Accept: application/json" "$@"; }
           postj(){ curl -sS -H "Content-Type: application/json" -H "Accept: application/json" -X POST -d "$2" "$1"; }
           patchj(){ curl -sS -H "Content-Type: application/json" -H "Accept: application/json" -X PATCH -d "$2" "$1"; }
-          del()   { curl -sS -X DELETE "$1"; }
 
           must(){
             local url="$1" expect="$2"; shift 2 || true
@@ -132,14 +131,6 @@ jobs:
           CODE=$(http -H "Content-Type: application/json" -X POST -d '{}' "$BASE/api/checkout/confirm")
           echo "   POST /checkout/confirm -> $CODE (ok si 200/201; 400 si faltan datos)"
 
-          echo; echo "== Admin productos (esperable 401/403 sin rol) =="
-          CODE=$(http -H "Content-Type: application/json" -X POST -d '{"name":"Tmp","price":9.99}' "$BASE/api/products/")
-          echo "   POST /api/products/ -> $CODE"
-          CODE=$(http -H "Content-Type: application/json" -X PATCH -d '{"price":7.99}' "$BASE/api/products/$PID")
-          echo "   PATCH /api/products/$PID -> $CODE"
-          CODE=$(http -X DELETE "$BASE/api/products/$PID")
-          echo "   DELETE /api/products/$PID -> $CODE"
-
           echo; echo "== CORS preflight =="
           curl -sS -I -X OPTIONS "$BASE/api/hello" \
             -H "Origin: http://localhost:5173" \
@@ -149,28 +140,32 @@ jobs:
           SH
           chmod +x scripts/smoke_api.sh
 
-      - name: Start Flask server (Flask 1.x style)
+      - name: Start server & run smoke (same step)
         env:
           FLASK_APP: src.app
         run: |
           set -euo pipefail
           echo "Arrancando Flask (${FLASK_APP})…"
-          nohup python -m flask run --host 0.0.0.0 --port "$PORT" > flask.log 2>&1 &
+          python -m flask run --host 0.0.0.0 --port "$PORT" > flask.log 2>&1 &
           pid=$!
+          trap 'echo "Matando Flask ($pid)"; kill $pid || true' EXIT
+
+          # Espera activa a que responda /api/ping
           for i in {1..120}; do
             if curl -sf "http://localhost:${PORT}/api/ping" >/dev/null; then
               echo "Servidor UP (pid=$pid)"; break
             fi
             if ! kill -0 "$pid" 2>/dev/null; then
-              echo "❌ Proceso Flask salió prematuramente"; break
+              echo "❌ Flask salió prematuramente"; echo "---- flask.log ----"; sed -n '1,200p' flask.log || true; exit 1
             fi
             sleep 1
           done
-          echo "---- tail flask.log ----"
-          tail -n 120 flask.log || true
 
-      - name: Run smoke tests
-        run: scripts/smoke_api.sh "$BASE_URL"
+          echo "---- tail flask.log ----"
+          tail -n 60 flask.log || true
+
+          echo "== Ejecutando smoke =="
+          scripts/smoke_api.sh "$BASE_URL"
 
       - name: Upload flask.log on failure
         if: failure()
@@ -178,7 +173,3 @@ jobs:
         with:
           name: flask-log
           path: flask.log
-
-      - name: Stop server
-        if: always()
-        run: pkill -f "flask run" || true
